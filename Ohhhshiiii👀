@@ -1,5 +1,5 @@
 -- Slashsaken — Fork of Forsaken Plus by Naiko Scripts
--- Obsidian UI port · fixes & rewrites by Viltrumite
+-- Obsidian UI · Name-based Auto Block · HDT · Aim Punch · by Viltrumite
 -- Copies of this script must contain the original credits and remain open source.
 
 if workspace.DistributedGameTime < 4 then
@@ -21,7 +21,7 @@ end)
 -- ============================================================
 -- Services & state
 -- ============================================================
-Version     = "2.30"
+Version     = "2.50"
 BrandName   = "Slashsaken"
 AuthorName  = "Viltrumite"
 DataFolder  = "Slashsaken/" .. BrandName
@@ -69,38 +69,45 @@ IsUnderground, IsFixingGenerator = false, false
 Values             = {}
 Connections        = {}
 AllAnimations      = {["Default Roblox"] = {["Idle"] = "http://www.roblox.com/asset/?id=180435571",["Walk"] = "http://www.roblox.com/asset/?id=180426354",["Run"] = "http://www.roblox.com/asset/?id=180426354"}}
+AnimationIdToName  = {}
 local NoliConfig, MainModule, IsRequireSupported, getgc = nil, nil, false, (rawget(getfenv(), "getgc") or rawget(getfenv(), "get_gc"))
 local fireproximitypromptFn = rawget(getfenv(), "fireproximityprompt") or rawget(getfenv(), "fire_proximity_prompt")
 local firesignalFn = rawget(getfenv(), "firesignal") or rawget(getfenv(), "fire_signal")
-local hookmetamethodFn = rawget(getfenv(), "hookmetamethod") or rawget(getfenv(), "hook_metamethod")
 ColorPresets = {White=Color3.fromRGB(255,255,255), Teal=Color3.fromRGB(3,252,157), Green=Color3.fromRGB(0,255,0), Purple=Color3.fromRGB(158,0,179), Red=Color3.fromRGB(255,0,0), Blue=Color3.fromRGB(0,0,255), Cyan=Color3.fromRGB(0,255,255), Gold=Color3.fromRGB(255,215,0), Orange=Color3.fromRGB(255,165,0)}
+
+-- Facing check state (built into Auto Block)
+detectionRange  = 18
+customFacingDot = 0.3
+facingVisuals   = {}
+
+-- HDT state
+HDT_Enabled     = false
+HDT_Speed       = 5.6
+HDT_Delay       = 0
+HDT_Debounce    = false
+
+-- Aim Punch state
+AimPunch_Enabled  = false
+AimPunch_CharLock = true
+AimPunch_CamLock  = false
+AimPunch_Duration = 0.8
+AimPunch_Prediction = 4
+AimPunch_Cooldown = 0.8
+aimPunchLastTrigger = 0
+
+-- Local player punch animation IDs (Guest 1337)
+LocalPunchAnimIds = {
+    "87259391926321","99100240941590","72685103823181","81905101227053",
+    "113936304594883","140703210927645","136007065400978","129843313690921",
+    "86709774283672","108807732150251","138040001965654","86096387000557",
+    "119850211147676","131696603025265","119462383658044","116618003477002",
+    "133491532453922","76649505662612","71190646367497",
+}
 
 local function Track(conn)
     if conn then table.insert(Connections, conn) end
     return conn
 end
-
--- ============================================================
--- Obsidian UI bootstrap
--- ============================================================
-local repo = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main/"
-local Library      = loadstring(game:HttpGet(repo .. "Library.lua"))()
-local ThemeManager = loadstring(game:HttpGet(repo .. "addons/ThemeManager.lua"))()
-local SaveManager  = loadstring(game:HttpGet(repo .. "addons/SaveManager.lua"))()
-
-local Options = Library.Options
-local Toggles = Library.Toggles
-
-Library.ForceCheckbox = false
-Library.ShowToggleFrameInKeybinds = true
-
-local Window = Library:CreateWindow({
-    Title      = BrandName,
-    Footer     = "v" .. Version .. " · by " .. AuthorName,
-    Icon       = 95816097006870,
-    NotifySide = "Right",
-    ShowCustomCursor = true,
-})
 
 -- ============================================================
 -- Helpers
@@ -138,6 +145,282 @@ function PlaySound(SoundName, Settings)
 end
 
 -- ============================================================
+-- Animation-name resolution (Forsaken Plus method)
+-- Reads KillerAssets.<Name>.Config.Animations and maps
+-- numeric ID -> semantic name ("Slash", "Stab", etc.)
+-- ============================================================
+function PopulateAnimations()
+    if not IsRequireSupported then return end
+    if not (KillerAssets and SurvivorAssets and SkinsAssets) then return end
+
+    local configs = {}
+    for _, v in KillerAssets:QueryDescendants("ModuleScript#Config") do table.insert(configs, v) end
+    for _, v in SurvivorAssets:QueryDescendants("ModuleScript#Config") do table.insert(configs, v) end
+    for _, v in SkinsAssets:QueryDescendants("ModuleScript#Config") do table.insert(configs, v) end
+
+    for _, cfg in configs do
+        if not cfg.Parent or cfg.Parent:IsA("Model") then continue end
+        local ok, data = pcall(require, cfg)
+        if not ok or type(data) ~= "table" or not data.Animations then continue end
+        local charName = cfg.Parent and cfg.Parent.Name or "?"
+        if data.DisplayName and data.DisplayName:find("Milestone") then
+            charName = string.format("%s %s", cfg.Parent and cfg.Parent.Parent and cfg.Parent.Parent.Name or charName, data.DisplayName:gsub("Milestone ", ""))
+        end
+        AllAnimations[charName] = data.Animations
+
+        for animName, animId in data.Animations do
+            if type(animId) == "table" then
+                for _, subId in animId do
+                    if type(subId) == "string" then
+                        local num = subId:match("%d+")
+                        if num then AnimationIdToName[num] = animName end
+                    end
+                end
+            elseif type(animId) == "string" then
+                local num = animId:match("%d+")
+                if num then AnimationIdToName[num] = animName end
+            end
+        end
+    end
+
+    local count = 0
+    for _ in pairs(AnimationIdToName) do count = count + 1 end
+    if count == 0 and Library and Library.Notify then
+        Library:Notify({
+            Title = "Auto Block Disabled",
+            Description = "Could not load killer animation configs. Auto Block will not fire.",
+            Time = 10,
+        })
+    end
+end
+
+function GetAnimationType(ID)
+    if not ID then return nil end
+    local num = tostring(ID):match("%d+")
+    if num and AnimationIdToName[num] then return AnimationIdToName[num] end
+    return nil
+end
+
+-- ============================================================
+-- Facing check (always enforced inside AutoBlock)
+-- ============================================================
+function isFacing(localRoot, targetRoot)
+    if not (localRoot and targetRoot) then return true end
+    local dx = localRoot.Position.X - targetRoot.Position.X
+    local dy = localRoot.Position.Y - targetRoot.Position.Y
+    local dz = localRoot.Position.Z - targetRoot.Position.Z
+    local mag = math.sqrt(dx*dx + dy*dy + dz*dz)
+    if mag == 0 then return true end
+    local invMag = 1 / mag
+    local ux, uy, uz = dx * invMag, dy * invMag, dz * invMag
+    local lv = targetRoot.CFrame.LookVector
+    local dot = lv.X * ux + lv.Y * uy + lv.Z * uz
+    return dot > (customFacingDot or 0.3)
+end
+
+local function updateFacingVisual(killer, visual)
+    if not (killer and visual and visual.Parent) then return end
+    local hrp = killer:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+    local dot = math.clamp(customFacingDot or 0.3, -1, 1)
+    local angle = math.acos(dot)
+    local frac = angle / math.pi
+    local minFrac = 0.20
+    local radius = math.max(1, detectionRange * (minFrac + (1 - minFrac) * frac))
+    visual.Radius = radius
+    visual.Height = 0.12
+    local forwardDist = detectionRange * (0.35 + 0.15 * frac)
+    local yOffset = -(hrp.Size.Y / 2 + 0.05)
+    visual.CFrame = CFrame.new(0, yOffset, -forwardDist) * CFrame.Angles(math.rad(90), 0, 0)
+    local myRoot = LocalCharacter and LocalCharacter:FindFirstChild("HumanoidRootPart")
+    if myRoot then
+        local dist = (hrp.Position - myRoot.Position).Magnitude
+        if dist <= detectionRange and isFacing(myRoot, hrp) then
+            visual.Color3 = Color3.fromRGB(255, 50, 50); visual.Transparency = 0.35
+        elseif dist <= detectionRange then
+            visual.Color3 = Color3.fromRGB(255, 165, 0); visual.Transparency = 0.55
+        else
+            visual.Color3 = Color3.fromRGB(255, 255, 0); visual.Transparency = 0.85
+        end
+    end
+end
+
+function addFacingVisual(killer)
+    if not killer or not killer:IsA("Model") then return end
+    if facingVisuals[killer] then return end
+    local hrp = killer:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+    local visual = Instance.new("CylinderHandleAdornment")
+    visual.Name = "FacingCheckVisual"; visual.Adornee = hrp
+    visual.AlwaysOnTop = true; visual.ZIndex = 2; visual.Transparency = 0.55
+    visual.Color3 = Color3.fromRGB(255, 255, 0)
+    visual.Parent = hrp
+    facingVisuals[killer] = visual
+    updateFacingVisual(killer, visual)
+end
+
+function removeFacingVisual(killer)
+    local v = facingVisuals[killer]
+    if v then pcall(function() v:Destroy() end); facingVisuals[killer] = nil end
+end
+
+Track(RunService.Heartbeat:Connect(function()
+    for killer, visual in pairs(facingVisuals) do
+        if not killer.Parent or not killer:FindFirstChild("HumanoidRootPart") then
+            removeFacingVisual(killer)
+        else
+            updateFacingVisual(killer, visual)
+        end
+    end
+end))
+
+-- ============================================================
+-- Killer lookup helpers
+-- ============================================================
+function getNearestKillerModel()
+    local myRoot = LocalCharacter and LocalCharacter:FindFirstChild("HumanoidRootPart")
+    if not myRoot or not KillersFolder then return nil end
+    local closest, closestDist = nil, math.huge
+    for _, k in KillersFolder:GetChildren() do
+        if k and k:IsA("Model") then
+            local hrp = k:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                local d = (hrp.Position - myRoot.Position).Magnitude
+                if d < closestDist then closest, closestDist = k, d end
+            end
+        end
+    end
+    return closest
+end
+
+function getKillerHRP(killerModel)
+    if not killerModel then return nil end
+    return killerModel:FindFirstChild("HumanoidRootPart") or killerModel.PrimaryPart or killerModel:FindFirstChildWhichIsA("BasePart", true)
+end
+
+-- ============================================================
+-- HDT — move toward killer at user speed + look at killer
+-- ============================================================
+function StartHDT(killer)
+    if not HDT_Enabled or HDT_Debounce then return end
+    if not killer or not killer.Parent then return end
+
+    local char = LocalPlayer.Character
+    if not char then return end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hrp or not hum then return end
+
+    local killerRoot = getKillerHRP(killer)
+    if not killerRoot then return end
+
+    HDT_Debounce = true
+
+    local oldWS = hum.WalkSpeed
+    local oldJP = hum.JumpPower
+    local oldPS = hum.PlatformStand
+    local oldAR = hum.AutoRotate
+
+    hum.WalkSpeed = 0
+    hum.JumpPower = 0
+    hum.PlatformStand = false
+    hum.AutoRotate = false
+
+    local bv = Instance.new("BodyVelocity")
+    bv.MaxForce = Vector3.new(1e5, 0, 1e5)
+    bv.Velocity = Vector3.new(0, 0, 0)
+    bv.Parent = hrp
+
+    if HDT_Delay > 0 then task.wait(HDT_Delay) end
+
+    local conn
+    conn = RunService.Heartbeat:Connect(function()
+        if not HDT_Debounce or not HDT_Enabled then
+            conn:Disconnect()
+            if bv and bv.Parent then pcall(function() bv:Destroy() end) end
+            if char and char.Parent and hum and hum.Parent then
+                hum.WalkSpeed = oldWS; hum.JumpPower = oldJP
+                hum.PlatformStand = oldPS; hum.AutoRotate = oldAR
+            end
+            return
+        end
+
+        if not (char and char.Parent) or not (killer and killer.Parent) then
+            HDT_Debounce = false; return
+        end
+
+        local currentRoot = getKillerHRP(killer)
+        if not currentRoot then HDT_Debounce = false; return end
+
+        local toTarget = currentRoot.Position - hrp.Position
+        local horiz = Vector3.new(toTarget.X, 0, toTarget.Z)
+
+        if horiz.Magnitude > 0.1 then
+            local dir = horiz.Unit
+            bv.Velocity = Vector3.new(dir.X * HDT_Speed, bv.Velocity.Y, dir.Z * HDT_Speed)
+            local lookAt = Vector3.new(currentRoot.Position.X, hrp.Position.Y, currentRoot.Position.Z)
+            pcall(function() hrp.CFrame = CFrame.lookAt(hrp.Position, lookAt) end)
+        end
+
+        if toTarget.Magnitude <= 2.5 then HDT_Debounce = false end
+    end)
+
+    task.delay(1.5 + HDT_Delay, function() if HDT_Debounce then HDT_Debounce = false end end)
+end
+
+-- ============================================================
+-- Aim Punch — lock char/camera onto killer when local punch anim plays
+-- ============================================================
+function DoAimLock()
+    if not AimPunch_Enabled then return end
+    if tick() - aimPunchLastTrigger < AimPunch_Cooldown then return end
+
+    local char = LocalPlayer.Character
+    if not char then return end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hrp or not hum then return end
+
+    local killer = getNearestKillerModel()
+    if not killer then return end
+    local killerRoot = killer:FindFirstChild("HumanoidRootPart")
+    if not killerRoot then return end
+
+    aimPunchLastTrigger = tick()
+
+    local oldAR = hum.AutoRotate
+    if AimPunch_CharLock then hum.AutoRotate = false end
+
+    task.spawn(function()
+        local start = tick()
+        local cam = workspace.CurrentCamera
+        while tick() - start < AimPunch_Duration do
+            if not (hrp and hrp.Parent) or not (killerRoot and killerRoot.Parent) then break end
+            local predicted = killerRoot.Position + killerRoot.CFrame.LookVector * AimPunch_Prediction
+            if AimPunch_CharLock then
+                pcall(function() hrp.CFrame = CFrame.lookAt(hrp.Position, Vector3.new(predicted.X, hrp.Position.Y, predicted.Z)) end)
+            end
+            if AimPunch_CamLock and cam then
+                pcall(function() cam.CFrame = CFrame.lookAt(cam.CFrame.Position, predicted) end)
+            end
+            task.wait()
+        end
+        if hum and hum.Parent and AimPunch_CharLock then hum.AutoRotate = oldAR end
+    end)
+end
+
+local function SetupLocalAimPunch(char)
+    local hum = char:FindFirstChildOfClass("Humanoid") or char:WaitForChild("Humanoid", 5)
+    local anim = hum and hum:FindFirstChildOfClass("Animator")
+    if not anim then return end
+    Track(anim.AnimationPlayed:Connect(function(track)
+        if not AimPunch_Enabled then return end
+        local animId = tostring(track.Animation and track.Animation.AnimationId or ""):match("%d+")
+        if animId and table.find(LocalPunchAnimIds, animId) then DoAimLock() end
+    end))
+end
+
+-- ============================================================
 -- Compat detection
 -- ============================================================
 task.spawn(function()
@@ -153,95 +436,84 @@ task.spawn(function()
             end
         end
     end
+    PopulateAnimations()
 end)
 
 -- ============================================================
--- Tabs (created synchronously — no race condition possible)
+-- Obsidian UI
+-- ============================================================
+local repo = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main/"
+local Library      = loadstring(game:HttpGet(repo .. "Library.lua"))()
+local ThemeManager = loadstring(game:HttpGet(repo .. "addons/ThemeManager.lua"))()
+local SaveManager  = loadstring(game:HttpGet(repo .. "addons/SaveManager.lua"))()
+
+local Options = Library.Options
+local Toggles = Library.Toggles
+
+Library.ForceCheckbox = false
+Library.ShowToggleFrameInKeybinds = true
+
+local Window = Library:CreateWindow({
+    Title      = BrandName,
+    Footer     = "v" .. Version .. " · by " .. AuthorName,
+    Icon       = 95816097006870,
+    NotifySide = "Right",
+    ShowCustomCursor = true,
+})
+
+-- ============================================================
+-- Tabs — Meowsaken structure
 -- ============================================================
 local Tabs = {
-    Automation = Window:AddTab("Automation",  "bot"),
-    Features   = Window:AddTab("Features",    "zap"),
-    Visuals    = Window:AddTab("Visuals",     "eye"),
-    Misc       = Window:AddTab("Miscellaneous", "sliders-horizontal"),
-    UI         = Window:AddTab("UI Settings", "settings"),
+    Notice    = Window:AddTab("Notice",          "info"),
+    ESP       = Window:AddTab("ESP",             "eye"),
+    Stam      = Window:AddTab("Stamina",         "zap"),
+    AutoBlock = Window:AddTab("Auto Block",      "shield"),
+    AutoPunch = Window:AddTab("Auto Punch",      "sword"),
+    AntiBait  = Window:AddTab("Anti Bait",       "target"),
+    Techs     = Window:AddTab("Techs",           "cpu"),
+    Killer    = Window:AddTab("Killer",          "skull"),
+    Generator = Window:AddTab("Generator",       "settings"),
+    Visual    = Window:AddTab("Visual",          "image"),
+    Misc      = Window:AddTab("Misc",            "box"),
+    UI        = Window:AddTab("UI Settings",     "sliders-horizontal"),
 }
 
 -- ============================================================
--- Groupboxes
--- ============================================================
-local GB = {
-    -- Automation
-    Gen      = Tabs.Automation:AddGroupbox({Side="Left",  Name="Generators",        IconName="zap"}),
-    GenCfg   = Tabs.Automation:AddGroupbox({Side="Left",  Name="Generator Config",  IconName="settings-2"}),
-    QTE      = Tabs.Automation:AddGroupbox({Side="Right", Name="Items & QTEs",      IconName="target"}),
-    -- Features
-    Protect  = Tabs.Features:AddGroupbox({Side="Left",  Name="Protection",       IconName="shield"}),
-    Movement = Tabs.Features:AddGroupbox({Side="Left",  Name="Movement",         IconName="footprints"}),
-    Combat   = Tabs.Features:AddGroupbox({Side="Left",  Name="Combat",           IconName="sword"}),
-    JohnDoe  = Tabs.Features:AddGroupbox({Side="Right", Name="John Doe",         IconName="skull"}),
-    Cosmetic = Tabs.Features:AddGroupbox({Side="Right", Name="Cosmetic",         IconName="sparkles"}),
-    -- Visuals
-    ESP      = Tabs.Visuals:AddGroupbox({Side="Left",  Name="ESP",           IconName="eye"}),
-    ESPColor = Tabs.Visuals:AddGroupbox({Side="Right", Name="ESP Colors",    IconName="palette"}),
-    NPC      = Tabs.Visuals:AddGroupbox({Side="Right", Name="NPCs",          IconName="users"}),
-    -- Misc
-    View     = Tabs.Misc:AddGroupbox({Side="Left",  Name="View",       IconName="eye-off"}),
-    Server   = Tabs.Misc:AddGroupbox({Side="Left",  Name="Server",     IconName="server"}),
-    Debug    = Tabs.Misc:AddGroupbox({Side="Right", Name="Debug",      IconName="bug"}),
-}
-
--- ============================================================
--- Core element-builder (with proper two-way binding + guards)
+-- Feature builder
 -- ============================================================
 local function AddFeature(groupbox, name, data)
-    -- 1. create backing instance (the real source of truth)
     local inst = Instance.new(data.InstanceType)
     inst.Name = name
     inst.Value = data.DefaultInstanceValue
     inst:SetAttribute("DisplayTitle", (data.DisplayTitle or name):gsub("<.->", ""))
     inst:SetAttribute("DisplayDescription", (data.DisplayDescription or ""):gsub("<.->", ""))
-    if data.ExtraData then
-        for k, v in data.ExtraData do inst:SetAttribute(k, v) end
-    end
+    if data.ExtraData then for k, v in data.ExtraData do inst:SetAttribute(k, v) end end
     inst.Parent = PlusFolderSettings
     data.Instance = inst
     Values[name] = inst
 
-    -- 2. fire initial ScriptFunction (Starting = true)
-    if data.ScriptFunction then
-        task.spawn(function() pcall(data.ScriptFunction, data, inst.Value, true) end)
-    end
+    if data.ScriptFunction then task.spawn(function() pcall(data.ScriptFunction, data, inst.Value, true) end) end
 
-    -- 3. element callback + instance-change guard
     local updating = false
-    local function fireSF(v)
-        if data.ScriptFunction then pcall(data.ScriptFunction, data, v, false) end
-    end
+    local function fireSF(v) if data.ScriptFunction then pcall(data.ScriptFunction, data, v, false) end end
 
     local cb = function(v)
-        if updating then return end
-        if inst.Value == v then return end
-        updating = true
-        inst.Value = v
-        fireSF(v)
-        updating = false
+        if updating or inst.Value == v then return end
+        updating = true; inst.Value = v; fireSF(v); updating = false
     end
 
     local element
     if data.InstanceType == "BoolValue" then
         element = groupbox:AddToggle(name, {
-            Text     = inst:GetAttribute("DisplayTitle"),
-            Tooltip  = inst:GetAttribute("DisplayDescription"),
-            Default  = inst.Value,
-            Callback = cb,
+            Text = inst:GetAttribute("DisplayTitle"), Tooltip = inst:GetAttribute("DisplayDescription"),
+            Default = inst.Value, Callback = cb,
         })
     elseif data.InstanceType == "NumberValue" then
         element = groupbox:AddSlider(name, {
-            Text     = inst:GetAttribute("DisplayTitle"),
-            Tooltip  = inst:GetAttribute("DisplayDescription"),
-            Default  = inst.Value,
-            Min      = inst:GetAttribute("MinValue") or 0,
-            Max      = inst:GetAttribute("MaxValue") or 100,
+            Text = inst:GetAttribute("DisplayTitle"), Tooltip = inst:GetAttribute("DisplayDescription"),
+            Default = inst.Value,
+            Min = inst:GetAttribute("MinValue") or 0, Max = inst:GetAttribute("MaxValue") or 100,
             Rounding = (inst:GetAttribute("Step") or 1) < 1 and 1 or 0,
             Callback = cb,
         })
@@ -251,47 +523,566 @@ local function AddFeature(groupbox, name, data)
         for part in optsStr:gmatch("[^|]+") do table.insert(opts, part) end
         if #opts == 0 then opts = {inst.Value} end
         element = groupbox:AddDropdown(name, {
-            Text     = inst:GetAttribute("DisplayTitle"),
-            Tooltip  = inst:GetAttribute("DisplayDescription"),
-            Values   = opts,
-            Default  = inst.Value,
-            Multi    = false,
-            Searchable = #opts > 10,
-            Callback = cb,
+            Text = inst:GetAttribute("DisplayTitle"), Tooltip = inst:GetAttribute("DisplayDescription"),
+            Values = opts, Default = inst.Value, Multi = false, Searchable = #opts > 10, Callback = cb,
         })
     end
 
-    -- instance → UI sync (catches programmatic changes e.g. Invincible → DisableToxicTrails)
     Track(inst:GetPropertyChangedSignal("Value"):Connect(function()
         if updating then return end
         if not element or element.Value == inst.Value then return end
         updating = true
         if element.SetValue then pcall(element.SetValue, element, inst.Value) end
-        fireSF(inst.Value)
-        updating = false
+        fireSF(inst.Value); updating = false
     end))
 
-    -- 4. lifecycle
     if data.CustomSetup then task.spawn(function() pcall(data.CustomSetup, data) end) end
-    if data.OnLoop then
-        Track(RunService.Heartbeat:Connect(function()
-            if data.OnLoop then pcall(data.OnLoop, data) end
-        end))
-    end
+    if data.OnLoop then Track(RunService.Heartbeat:Connect(function() pcall(data.OnLoop, data) end)) end
     if data.CharacterAdded then
         Track(LocalPlayer.CharacterAdded:Connect(function()
             task.delay(0, function() pcall(data.CharacterAdded, data) end)
         end))
     end
-
     return element, inst
 end
 
--- ============================================================
--- ═══ AUTOMATION TAB ═══
--- ============================================================
-AddFeature(GB.Gen, "AutoGeneratorPuzzle", {
-    DisplayTitle = "Auto Generator", DisplayDescription = "Automatically completes generator puzzles when nearby",
+-- ═══════════════════════════════════════════════════════════
+-- NOTICE
+-- ═══════════════════════════════════════════════════════════
+local NoticeGB = Tabs.Notice:AddGroupbox({Side="Left", Name="Welcome", IconName="info"})
+NoticeGB:AddLabel("Slashsaken v" .. Version .. " by " .. AuthorName)
+NoticeGB:AddDivider()
+NoticeGB:AddLabel("Auto Block uses Forsaken Plus's name-based filter:")
+NoticeGB:AddLabel("Only fires on: slash, enragedslash, stab, attack, punch, swing, golemslash")
+NoticeGB:AddLabel("Facing check is built into Auto Block — no toggle to disable.")
+NoticeGB:AddDivider()
+NoticeGB:AddLabel("Features: Auto Block · HDT · Aim Punch · ESP · Stamina · Generators · Anti Bait")
+
+-- ═══════════════════════════════════════════════════════════
+-- ESP
+-- ═══════════════════════════════════════════════════════════
+local ESPGB    = Tabs.ESP:AddGroupbox({Side="Left",  Name="ESP",         IconName="eye"})
+local ESPCGB   = Tabs.ESP:AddGroupbox({Side="Right", Name="ESP Colors",  IconName="palette"})
+
+AddFeature(ESPGB, "ESP", {
+    DisplayTitle = "ESP Master", DisplayDescription = "Wallhack for players, generators, items",
+    InstanceType = "BoolValue", DefaultInstanceValue = false, Savable = true,
+    ScriptFunction = function(self, v)
+        if not v then
+            for _, root in {PlayersFolder, GameMap, InGame, workspace} do
+                if root then
+                    for _, d in root:GetDescendants() do
+                        local h = d:FindFirstChild("_SS_ESP");    if h then h:Destroy() end
+                        local t = d:FindFirstChild("_SS_ESPText"); if t then t:Destroy() end
+                    end
+                end
+            end
+        end
+    end,
+    OnLoop = function()
+        if not GetValue("ESP") then return end
+        local cam = workspace.CurrentCamera
+        if not cam then return end
+        if PlayersFolder then
+            for _, pm in PlayersFolder:QueryDescendants("#Killers > Instance, #Survivors > Instance") do
+                local plr = Players:GetPlayerFromCharacter(pm)
+                local hum = pm:FindFirstChildOfClass("Humanoid")
+                local root = pm:FindFirstChild("HumanoidRootPart")
+                local folder = pm.Parent and pm.Parent.Name or ""
+                local en = GetValue(folder .. "ESP")
+                if plr and hum and hum.Health > 0 and root and en then
+                    local color = ColorPresets[GetValue(folder .. "Color")] or Color3.new(1,1,1)
+                    local hl = pm:FindFirstChild("_SS_ESP")
+                    if not hl then
+                        hl = Instance.new("Highlight"); hl.Name = "_SS_ESP"
+                        hl.FillTransparency = 0.55; hl.OutlineTransparency = 0
+                        hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+                        hl.Adornee = pm; hl.Parent = pm
+                    end
+                    hl.FillColor = color; hl.OutlineColor = color
+                    if GetValue("ShowText") then
+                        local bg = pm:FindFirstChild("_SS_ESPText")
+                        if not bg then
+                            bg = Instance.new("BillboardGui"); bg.Name = "_SS_ESPText"; bg.Adornee = root
+                            bg.Size = UDim2.fromOffset(180, 44); bg.StudsOffset = Vector3.new(0, 3.2, 0)
+                            bg.AlwaysOnTop = true; bg.Parent = pm
+                            local t = Instance.new("TextLabel"); t.Parent = bg; t.Size = UDim2.fromScale(1,1)
+                            t.BackgroundTransparency = 1; t.TextScaled = true
+                            t.TextStrokeTransparency = 0.4; t.Font = Enum.Font.GothamBold
+                        end
+                        bg.Adornee = root
+                        local t = bg:FindFirstChildWhichIsA("TextLabel")
+                        if t then t.Text = plr.Name; t.TextColor3 = color end
+                    else
+                        local bg = pm:FindFirstChild("_SS_ESPText"); if bg then bg:Destroy() end
+                    end
+                else
+                    local hl = pm:FindFirstChild("_SS_ESP"); if hl then hl:Destroy() end
+                    local bg = pm:FindFirstChild("_SS_ESPText"); if bg then bg:Destroy() end
+                end
+            end
+        end
+        if GameMap and GetValue("GeneratorsESP") then
+            local color = ColorPresets[GetValue("GeneratorsColor")] or Color3.new(0,1,1)
+            for _, gen in GameMap:QueryDescendants("Model#Generator:has(#Main)") do
+                local prog = gen:FindFirstChild("Progress")
+                local done = GetValue("GeneratorsCheck") and prog and prog.Value >= 100
+                if done then
+                    local h = gen:FindFirstChild("_SS_ESP"); if h then h:Destroy() end
+                else
+                    local hl = gen:FindFirstChild("_SS_ESP")
+                    if not hl then
+                        hl = Instance.new("Highlight"); hl.Name = "_SS_ESP"
+                        hl.FillTransparency = 0.55; hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+                        hl.Adornee = gen; hl.Parent = gen
+                    end
+                    hl.FillColor = color; hl.OutlineColor = color
+                end
+            end
+        end
+    end,
+})
+AddFeature(ESPGB, "ShowText",       {DisplayTitle="ESP Show Names", DisplayDescription="Show player names", InstanceType="BoolValue", DefaultInstanceValue=true, Savable=true})
+AddFeature(ESPGB, "KillersESP",     {DisplayTitle="Killer ESP",     InstanceType="BoolValue", DefaultInstanceValue=true,  Savable=true})
+AddFeature(ESPGB, "SurvivorsESP",   {DisplayTitle="Survivor ESP",   InstanceType="BoolValue", DefaultInstanceValue=false, Savable=true})
+AddFeature(ESPGB, "GeneratorsESP",  {DisplayTitle="Generator ESP",  InstanceType="BoolValue", DefaultInstanceValue=false, Savable=true})
+AddFeature(ESPGB, "GeneratorsCheck",{DisplayTitle="Hide Finished Gens", InstanceType="BoolValue", DefaultInstanceValue=true, Savable=true})
+AddFeature(ESPCGB, "KillersColor",   {DisplayTitle="Killer ESP Color",    InstanceType="StringValue", DefaultInstanceValue="Red",   Savable=true, ExtraData={Options="Red|Orange|Purple|Gold"}})
+AddFeature(ESPCGB, "SurvivorsColor", {DisplayTitle="Survivor ESP Color",  InstanceType="StringValue", DefaultInstanceValue="Green", Savable=true, ExtraData={Options="Green|Orange|Purple|Gold"}})
+AddFeature(ESPCGB, "GeneratorsColor",{DisplayTitle="Generator ESP Color", InstanceType="StringValue", DefaultInstanceValue="Cyan",  Savable=true, ExtraData={Options="Cyan|Blue|Green|Orange|Purple|Gold"}})
+
+-- ═══════════════════════════════════════════════════════════
+-- STAMINA
+-- ═══════════════════════════════════════════════════════════
+local StamGB = Tabs.Stam:AddGroupbox({Side="Left", Name="Stamina", IconName="zap"})
+
+AddFeature(StamGB, "StaminaPreset", {
+    DisplayTitle = "Stamina Preset", DisplayDescription = "Original / Realistic / Semi-Realistic / Infinite",
+    InstanceType = "StringValue", DefaultInstanceValue = "Original", Savable = true,
+    ExtraData = {Options = "Original|Realistic|Semi-Realistic|Infinite"},
+    OnLoop = function()
+        if not MainModule or not MainModule.MaxStamina then return end
+        local preset = GetValue("StaminaPreset")
+        if preset == "Original" then return end
+        local maxSt = MainModule.MaxStamina
+        local cur = MainModule.Stamina or maxSt
+        if preset == "Infinite" then
+            rawset(MainModule, "Stamina", maxSt)
+        elseif preset == "Semi-Realistic" then
+            rawset(MainModule, "Stamina", math.min(cur + maxSt * 0.006, maxSt))
+        elseif preset == "Realistic" then
+            rawset(MainModule, "Stamina", math.min(cur + maxSt * 0.003, maxSt))
+        end
+    end,
+    ScriptFunction = function(self, v)
+        if v == "Original" and MainModule and MainModule.MaxStamina then
+            rawset(MainModule, "Stamina", MainModule.MaxStamina)
+        end
+    end,
+})
+AddFeature(StamGB, "AntiSlowness", {
+    DisplayTitle = "Anti Slowness", DisplayDescription = "Removes all slowness effects",
+    InstanceType = "BoolValue", DefaultInstanceValue = false, Savable = true,
+    ScriptFunction = function(self, v)
+        if not v or not SpeedMultipliers then return end
+        for _, c in SpeedMultipliers:GetChildren() do
+            if c:IsA("NumberValue") and c.Name ~= "Sprinting" and c.Name:lower() ~= "emoting"
+                and c.Name ~= "DirectionalMovement" and c.Name ~= "FixingGenerator"
+                and c.Name:upper() ~= "ENRAGED" and c.Value > 0.05 and c.Value < 1 then
+                c.Value = 1
+            end
+        end
+    end,
+})
+
+-- ═══════════════════════════════════════════════════════════
+-- AUTO BLOCK (name-based + facing built-in)
+-- ═══════════════════════════════════════════════════════════
+local BlockGB  = Tabs.AutoBlock:AddGroupbox({Side="Left",  Name="Blocking",        IconName="shield"})
+local CircleGB = Tabs.AutoBlock:AddGroupbox({Side="Right", Name="Facing Circle",   IconName="circle"})
+local QTE_GB   = Tabs.AutoBlock:AddGroupbox({Side="Right", Name="Escape & Disarm", IconName="door-open"})
+
+AddFeature(BlockGB, "AutoBlock", {
+    DisplayTitle = "Auto Block",
+    DisplayDescription = "Only fires on blockable basic attacks (slash/stab/attack/etc.) while you're in the facing circle.",
+    InstanceType = "BoolValue", DefaultInstanceValue = false, Savable = true,
+    CustomSetup = function()
+        if not KillersFolder then return end
+
+        -- Forsaken Plus blockable attack NAMES
+        local BlockableAttacks = {"slash", "enragedslash", "stab", "attack", "punch", "swing", "golemslash"}
+        local LEAD, COOLDOWN, SWEEP_WINDOW, SWEEP_MUL = 0.02, 0.35, 0.55, 2.5
+
+        local function SetupKiller(Killer)
+            local Hum = Killer:FindFirstChildOfClass("Humanoid") or Killer:WaitForChild("Humanoid", 5)
+            local Anim = Hum and Hum:FindFirstChildOfClass("Animator")
+            if not Anim then return end
+
+            local lastBlockAt = 0
+            local remote = Network and Network:FindFirstChildOfClass("RemoteEvent")
+
+            local function DoBlock(currentTrack)
+                if not Killer or not Killer.Parent then return end
+                if currentTrack and currentTrack.Animation then
+                    local curName = GetAnimationType(currentTrack.Animation.AnimationId)
+                    if not curName or not table.find(BlockableAttacks, curName:lower()) then return end
+                end
+                local kr = Killer:FindFirstChild("HumanoidRootPart")
+                if not (kr and LocalRoot) then return end
+                if (kr.Position - LocalRoot.Position).Magnitude > detectionRange then return end
+                if not isFacing(LocalRoot, kr) then return end
+
+                if tick() - lastBlockAt < COOLDOWN then return end
+                lastBlockAt = tick()
+
+                local btn = MainUI and MainUI:FindFirstChild("AbilityContainer") and MainUI.AbilityContainer:FindFirstChild("Block")
+                if btn and btn.MouseButton1Click and firesignalFn then pcall(firesignalFn, btn.MouseButton1Click) end
+                if remote then
+                    pcall(function() remote:FireServer("UseActorAbility", {"Block"}) end)
+                    pcall(function() remote:FireServer("UseActorAbility", "Block") end)
+                end
+            end
+
+            local selfParams = OverlapParams.new()
+            selfParams.FilterType = Enum.RaycastFilterType.Include
+            selfParams.MaxParts = 1
+
+            Track(Anim.AnimationPlayed:Connect(function(track)
+                if not GetValue("AutoBlock") then return end
+
+                -- GATE 1: name-based — only real basic attacks
+                local animName = GetAnimationType(track.Animation and track.Animation.AnimationId or "")
+                if not animName or not table.find(BlockableAttacks, animName:lower()) then return end
+
+                -- GATE 2: local player is a live survivor
+                if not LocalCharacter or LocalCharacter.Parent ~= SurvivorsFolder then return end
+                if not LocalCharacter:FindFirstChild("QueryHitbox") then return end
+
+                -- GATE 3: range + facing (built-in)
+                local kr = Killer:FindFirstChild("HumanoidRootPart")
+                if not (kr and LocalRoot) then return end
+                if (kr.Position - LocalRoot.Position).Magnitude > detectionRange then return end
+                if not isFacing(LocalRoot, kr) then return end
+
+                -- HDT: drag into killer while block registers
+                task.spawn(function() StartHDT(Killer) end)
+
+                task.delay(LEAD, function() DoBlock(track) end)
+
+                local stop = tick() + math.min(track.Length > 0 and track.Length or SWEEP_WINDOW, SWEEP_WINDOW)
+                local conn
+                conn = Track(RunService.PreSimulation:Connect(function()
+                    if tick() > stop or not GetValue("AutoBlock") or not conn then
+                        if conn then conn:Disconnect() end; return
+                    end
+                    if not LocalCharacter or not LocalCharacter:FindFirstChild("QueryHitbox") then
+                        if conn then conn:Disconnect() end; return
+                    end
+                    local kh = Killer:FindFirstChild("QueryHitbox")
+                    if not kh then return end
+                    selfParams.FilterDescendantsInstances = {LocalCharacter.QueryHitbox}
+                    local p = Instance.new("Part")
+                    p.Size = Vector3.new(5.2, 6, 5.65) * SWEEP_MUL
+                    p.CFrame = kh.CFrame * CFrame.new(0, 0, -3.5)
+                    p.CanCollide = false; p.Anchored = true; p.CastShadow = false; p.Transparency = 1
+                    p.Parent = Hitboxes or workspace
+                    local hit = #workspace:GetPartsInPart(p, selfParams) > 0
+                    p:Destroy()
+                    if hit then DoBlock(track) end
+                end))
+            end))
+        end
+
+        Track(KillersFolder.ChildAdded:Connect(function(k) task.wait(0.5); SetupKiller(k) end))
+        for _, k in KillersFolder:GetChildren() do task.spawn(SetupKiller, k) end
+    end,
+})
+
+AddFeature(CircleGB, "FacingCircleRange", {
+    DisplayTitle = "Facing Circle Range",
+    DisplayDescription = "Distance (studs) auto block scans",
+    InstanceType = "NumberValue", DefaultInstanceValue = 18, Savable = true,
+    ExtraData = {MinValue = 5, MaxValue = 50, Step = 1},
+    ScriptFunction = function(self, v) detectionRange = math.clamp(tonumber(v) or 18, 5, 50) end,
+})
+AddFeature(CircleGB, "FacingCircleAngle", {
+    DisplayTitle = "Facing Cone Angle",
+    DisplayDescription = "Cone width in degrees. Lower = tighter",
+    InstanceType = "NumberValue", DefaultInstanceValue = 72, Savable = true,
+    ExtraData = {MinValue = 30, MaxValue = 150, Step = 1},
+    ScriptFunction = function(self, v) customFacingDot = math.cos(math.rad(math.clamp(tonumber(v) or 72, 30, 150))) end,
+})
+AddFeature(CircleGB, "ShowFacingCircle", {
+    DisplayTitle = "Show Facing Circle",
+    DisplayDescription = "Visual indicator. Red = block fires, orange = in range but not facing, yellow = safe",
+    InstanceType = "BoolValue", DefaultInstanceValue = false, Savable = true,
+    CustomSetup = function()
+        if not KillersFolder then return end
+        Track(KillersFolder.ChildAdded:Connect(function(k)
+            if GetValue("ShowFacingCircle") then
+                task.spawn(function()
+                    local hrp = k:WaitForChild("HumanoidRootPart", 5)
+                    if hrp and GetValue("ShowFacingCircle") then addFacingVisual(k) end
+                end)
+            end
+        end))
+        Track(KillersFolder.ChildRemoved:Connect(removeFacingVisual))
+    end,
+    ScriptFunction = function(self, v)
+        if not KillersFolder then return end
+        if v then
+            for _, k in KillersFolder:GetChildren() do
+                task.spawn(function()
+                    local hrp = k:WaitForChild("HumanoidRootPart", 5)
+                    if hrp and GetValue("ShowFacingCircle") then addFacingVisual(k) end
+                end)
+            end
+        else
+            for k in pairs(facingVisuals) do removeFacingVisual(k) end
+        end
+    end,
+})
+
+AddFeature(QTE_GB, "AutoEscape", {
+    DisplayTitle = "Auto Escape (Nosferatu)",
+    DisplayDescription = "Auto-escapes Nosferatu's hook QTE",
+    InstanceType = "BoolValue", DefaultInstanceValue = false, Savable = true,
+    CustomSetup = function()
+        if not TempUI then return end
+        Track(TempUI.ChildAdded:Connect(function(ui)
+            if ui.Name:upper() == "QTE" then
+                while ui and ui.Visible do
+                    local cd = GetValue("EscapeCooldown") or 0.5
+                    task.wait(Random.new():NextNumber(cd * 0.8, cd * 1.2))
+                    if GetValue("AutoEscape") and KillersFolder and Network then
+                        for _, v in KillersFolder:GetChildren() do
+                            if v.Name:lower() == "nosferatu" then
+                                local plr = Players:GetPlayerFromCharacter(v)
+                                if plr then
+                                    pcall(function() Network:FindFirstChildOfClass("RemoteEvent"):FireServer(plr.Name .. "NosHookQTE", {true}) end)
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end))
+    end,
+})
+AddFeature(QTE_GB, "EscapeCooldown", {
+    DisplayTitle = "Escape Cooldown", DisplayDescription = "Seconds between auto-escape attempts",
+    InstanceType = "NumberValue", DefaultInstanceValue = 0.5, Savable = true,
+    ExtraData = {MinValue = 0.2, MaxValue = 1.2, Step = 0.1},
+})
+AddFeature(QTE_GB, "AutoDisarm", {
+    DisplayTitle = "Auto Disarm (Azure)",
+    DisplayDescription = "Auto-disarms Azure's traps",
+    InstanceType = "BoolValue", DefaultInstanceValue = false, Savable = true,
+})
+
+-- ═══════════════════════════════════════════════════════════
+-- AUTO PUNCH (with aim punch)
+-- ═══════════════════════════════════════════════════════════
+local PunchGB = Tabs.AutoPunch:AddGroupbox({Side="Left",  Name="Punch",     IconName="sword"})
+local AimGB   = Tabs.AutoPunch:AddGroupbox({Side="Right", Name="Aim Punch", IconName="crosshair"})
+
+AddFeature(PunchGB, "AutoPunch", {
+    DisplayTitle = "Auto Punch",
+    DisplayDescription = "Fires punch after a successful block",
+    InstanceType = "BoolValue", DefaultInstanceValue = false, Savable = true,
+    CustomSetup = function()
+        if not LocalCharacter then return end
+        Track(LocalCharacter:GetAttributeChangedSignal("TimesHit"):Connect(function()
+            if not GetValue("AutoPunch") then return end
+            if not SpeedMultipliers or not SpeedMultipliers:FindFirstChild("GuestBlocking") then return end
+            if (LocalHumanoid:GetAttribute("Overheal") or 0) < 10 then return end
+            task.wait(0.08)
+            -- aim punch first, then fire
+            if AimPunch_Enabled then DoAimLock() end
+            local btn = MainUI and MainUI:FindFirstChild("AbilityContainer") and MainUI.AbilityContainer:FindFirstChild("Punch")
+            if btn and btn.MouseButton1Click and firesignalFn then pcall(firesignalFn, btn.MouseButton1Click) end
+            local remote = Network and Network:FindFirstChildOfClass("RemoteEvent")
+            if remote then
+                pcall(function() remote:FireServer("UseActorAbility", {"Punch"}) end)
+                pcall(function() remote:FireServer("UseActorAbility", "Punch") end)
+            end
+        end))
+    end,
+})
+
+AddFeature(AimGB, "AimPunch", {
+    DisplayTitle = "Aim Punch",
+    DisplayDescription = "Locks character onto killer when your punch animation plays",
+    InstanceType = "BoolValue", DefaultInstanceValue = false, Savable = true,
+    ScriptFunction = function(self, v) AimPunch_Enabled = v end,
+    CustomSetup = function()
+        if LocalCharacter then SetupLocalAimPunch(LocalCharacter) end
+        Track(LocalPlayer.CharacterAdded:Connect(function(char) task.wait(0.5); SetupLocalAimPunch(char) end))
+    end,
+})
+AddFeature(AimGB, "AimPunchCharLock", {
+    DisplayTitle = "Character Lock", DisplayDescription = "Rotate character toward killer",
+    InstanceType = "BoolValue", DefaultInstanceValue = true, Savable = true,
+    ScriptFunction = function(self, v) AimPunch_CharLock = v end,
+})
+AddFeature(AimGB, "AimPunchCamLock", {
+    DisplayTitle = "Camera Lock", DisplayDescription = "Rotate camera toward killer",
+    InstanceType = "BoolValue", DefaultInstanceValue = false, Savable = true,
+    ScriptFunction = function(self, v) AimPunch_CamLock = v end,
+})
+AddFeature(AimGB, "AimPunchDuration", {
+    DisplayTitle = "Aim Lock Duration", DisplayDescription = "Seconds aim lock stays active",
+    InstanceType = "NumberValue", DefaultInstanceValue = 0.8, Savable = true,
+    ExtraData = {MinValue = 0.2, MaxValue = 2, Step = 0.1},
+    ScriptFunction = function(self, v) AimPunch_Duration = tonumber(v) or 0.8 end,
+})
+AddFeature(AimGB, "AimPunchPrediction", {
+    DisplayTitle = "Aim Prediction", DisplayDescription = "Studs ahead of killer to aim at",
+    InstanceType = "NumberValue", DefaultInstanceValue = 4, Savable = true,
+    ExtraData = {MinValue = 0, MaxValue = 20, Step = 0.5},
+    ScriptFunction = function(self, v) AimPunch_Prediction = tonumber(v) or 4 end,
+})
+
+-- ═══════════════════════════════════════════════════════════
+-- ANTI BAIT (walls, bait trick)
+-- ═══════════════════════════════════════════════════════════
+local AntiGB = Tabs.AntiBait:AddGroupbox({Side="Left", Name="Anti Bait", IconName="target"})
+AddFeature(AntiGB, "DisableKillerWalls", {
+    DisplayTitle = "Disable Killer Walls", DisplayDescription = "Walk through thin killer-only walls",
+    InstanceType = "BoolValue", DefaultInstanceValue = false, Savable = false,
+    ScriptFunction = function(self, v)
+        local folder = GameMap and (GameMap:FindFirstChild("KillerDoors", true) or GameMap:FindFirstChild("Killer Doors", true))
+        if not folder then return end
+        for _, p in folder:GetChildren() do
+            if p:IsA("BasePart") and math.min(p.Size.X, p.Size.Z) <= 5 then
+                p.CanTouch = true
+                if p:GetAttribute("OriginalCanCollide") == nil then
+                    p:SetAttribute("OriginalCanCollide", p.CanCollide)
+                end
+                p.CanCollide = p:GetAttribute("OriginalCanCollide") ~= false and not v or false
+            end
+        end
+    end,
+})
+
+-- ═══════════════════════════════════════════════════════════
+-- TECHS (HDT + Fake Lag)
+-- ═══════════════════════════════════════════════════════════
+local TechGB = Tabs.Techs:AddGroupbox({Side="Left", Name="Hitbox Dragging Tech (HDT)", IconName="cpu"})
+AddFeature(TechGB, "HDT", {
+    DisplayTitle = "HDT Enabled",
+    DisplayDescription = "When auto block detects an attack, drags you into the killer's hitbox at HDT Speed while facing them",
+    InstanceType = "BoolValue", DefaultInstanceValue = false, Savable = true,
+    ScriptFunction = function(self, v) HDT_Enabled = v end,
+})
+AddFeature(TechGB, "HDTSpeed", {
+    DisplayTitle = "HDT Speed (studs/sec)", DisplayDescription = "How fast you slide toward the killer",
+    InstanceType = "NumberValue", DefaultInstanceValue = 5.6, Savable = true,
+    ExtraData = {MinValue = 1, MaxValue = 30, Step = 0.1},
+    ScriptFunction = function(self, v) HDT_Speed = tonumber(v) or 5.6 end,
+})
+AddFeature(TechGB, "HDTDelay", {
+    DisplayTitle = "HDT Delay (sec)", DisplayDescription = "Delay before HDT starts moving",
+    InstanceType = "NumberValue", DefaultInstanceValue = 0, Savable = true,
+    ExtraData = {MinValue = 0, MaxValue = 1, Step = 0.05},
+    ScriptFunction = function(self, v) HDT_Delay = tonumber(v) or 0 end,
+})
+
+local FakeLagGB = Tabs.Techs:AddGroupbox({Side="Right", Name="Fake Lag", IconName="timer"})
+FakeLagGB:AddButton({
+    Text = "Trigger Fake Lag",
+    Tooltip = "Play a fake lag animation to confuse the killer",
+    Func = function()
+        pcall(function()
+            local char = LocalPlayer.Character
+            if not char then return end
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            if not hum then return end
+            local animator = hum:FindFirstChildOfClass("Animator") or Instance.new("Animator", hum)
+            for _, t in ipairs(animator:GetPlayingAnimationTracks()) do
+                local id = tostring(t.Animation and t.Animation.AnimationId or ""):match("%d+")
+                if id == "136252471123500" then pcall(function() t:Stop() end) end
+            end
+            local anim = Instance.new("Animation")
+            anim.AnimationId = "rbxassetid://136252471123500"
+            local track = animator:LoadAnimation(anim)
+            track:Play()
+        end)
+    end,
+})
+
+-- ═══════════════════════════════════════════════════════════
+-- KILLER (dash, void rush, NPC hides, animations)
+-- ═══════════════════════════════════════════════════════════
+local KillerGB = Tabs.Killer:AddGroupbox({Side="Left",  Name="Killer Features", IconName="skull"})
+local NPCGB    = Tabs.Killer:AddGroupbox({Side="Right", Name="NPC Hides",       IconName="users"})
+
+AddFeature(KillerGB, "NoliControl", {
+    DisplayTitle = "Better Void Rush", DisplayDescription = "Better control of Noli's Void Rush",
+    InstanceType = "BoolValue", DefaultInstanceValue = false, Savable = true,
+    ScriptFunction = function(self, v)
+        if not NoliConfig then return end
+        for _, entry in {
+            {Name = "InitialTurnDuration", Value = 0.005, Default = 1.5},
+            {Name = "TurnSpeed", Value = 10000, Default = 1},
+            {Name = "InitialTurnMult", Value = 1000, Default = 6.6},
+        } do
+            local _, key, parent = TableValueFind(NoliConfig, function(k) return type(k) == "string" and k:find(entry.Name) and not k:find("OG") end)
+            if key and parent then
+                if v then parent[key .. "OG"] = parent[key .. "OG"] or parent[key]; parent[key] = entry.Value
+                else parent[key] = parent[key .. "OG"] or entry.Default end
+            end
+        end
+    end,
+})
+AddFeature(KillerGB, "ControllableDash", {
+    DisplayTitle = "Controllable Coolkidd Dash", DisplayDescription = "Coolkidd's dash becomes steerable",
+    InstanceType = "BoolValue", DefaultInstanceValue = false, Savable = true,
+})
+
+AddFeature(NPCGB, "DisableNoliNPC", {
+    DisplayTitle = "Disable Noli NPC", DisplayDescription = "Hides Noli's distracting NPC",
+    InstanceType = "BoolValue", DefaultInstanceValue = false, Savable = true,
+    ScriptFunction = function(self, v)
+        if not KillersFolder then return end
+        if v then
+            for _, m in KillersFolder:GetChildren() do
+                if m.Name:lower() == "noli" and not Players:GetPlayerFromCharacter(m) then
+                    m.Parent = Lighting; m:PivotTo(m:GetPivot() * CFrame.new(0, -100, 0))
+                end
+            end
+        else
+            for _, m in Lighting:GetChildren() do
+                if m.Name:lower() == "noli" then m.Parent = InGame; m:PivotTo(m:GetPivot() * CFrame.new(0, 100, 0)) end
+            end
+        end
+    end,
+})
+AddFeature(NPCGB, "Disable007n7NPC", {
+    DisplayTitle = "Disable 007n7 NPC", DisplayDescription = "Hides 007n7's distracting NPC",
+    InstanceType = "BoolValue", DefaultInstanceValue = false, Savable = true,
+    ScriptFunction = function(self, v)
+        if not InGame then return end
+        if v then
+            for _, m in InGame:GetChildren() do
+                if m.Name:lower() == "007n7" and not Players:GetPlayerFromCharacter(m) then m.Parent = Lighting end
+            end
+        else
+            for _, m in Lighting:GetChildren() do
+                if m.Name:lower() == "007n7" then m.Parent = InGame end
+            end
+        end
+    end,
+})
+
+-- ═══════════════════════════════════════════════════════════
+-- GENERATOR
+-- ═══════════════════════════════════════════════════════════
+local GenGB  = Tabs.Generator:AddGroupbox({Side="Left",  Name="Auto Generator", IconName="zap"})
+local GenCGB = Tabs.Generator:AddGroupbox({Side="Right", Name="Overrides",      IconName="settings-2"})
+
+AddFeature(GenGB, "AutoGeneratorPuzzle", {
+    DisplayTitle = "Auto Generator", DisplayDescription = "Auto-completes generator puzzles when nearby",
     InstanceType = "BoolValue", DefaultInstanceValue = false, Savable = true,
     RNG = Random.new(),
     IsPlayersNear = function(self, d)
@@ -333,112 +1124,74 @@ AddFeature(GB.Gen, "AutoGeneratorPuzzle", {
         end
     end,
 })
-AddFeature(GB.Gen, "GeneratorCooldown", {
+AddFeature(GenGB, "GeneratorCooldown", {
     DisplayTitle = "Generator Cooldown", DisplayDescription = "Seconds between auto-completions",
     InstanceType = "NumberValue", DefaultInstanceValue = 4, Savable = true,
     ExtraData = {MinValue = 1.5, MaxValue = 8, Step = 0.25},
 })
-AddFeature(GB.Gen, "SpeedUpCooldown", {
+AddFeature(GenGB, "SpeedUpCooldown", {
     DisplayTitle = "Speed Up When Alone", DisplayDescription = "Shorter cooldown if nobody is within 32 studs",
     InstanceType = "BoolValue", DefaultInstanceValue = false, Savable = true,
 })
-AddFeature(GB.QTE, "AutoPickup", {
-    DisplayTitle = "Auto Pickup", DisplayDescription = "Auto-picks up nearby tools/items",
+AddFeature(GenCGB, "EnableOverride", {
+    DisplayTitle = "Override Generator Grid", DisplayDescription = "Force a custom grid size",
     InstanceType = "BoolValue", DefaultInstanceValue = false, Savable = true,
-    OnLoop = function()
-        if not GetValue("AutoPickup") or not LocalRoot or not InGame then return end
-        for _, v in InGame:QueryDescendants("Tool") do
-            local part = v:FindFirstChildWhichIsA("BasePart")
-            if part and not v:GetAttribute("JustDropped") and (part.Position - LocalRoot.Position).Magnitude < 5 then
-                local prompt = v:FindFirstChildWhichIsA("ProximityPrompt", true)
-                if prompt and fireproximitypromptFn then pcall(fireproximitypromptFn, prompt) end
-            end
-        end
+})
+AddFeature(GenCGB, "GridSize", {
+    DisplayTitle = "Generator Grid Size", DisplayDescription = "4x4 up to 12x12",
+    InstanceType = "NumberValue", DefaultInstanceValue = 6, Savable = true,
+    ExtraData = {MinValue = 4, MaxValue = 12, Step = 1},
+})
+
+-- ═══════════════════════════════════════════════════════════
+-- VISUAL
+-- ═══════════════════════════════════════════════════════════
+local VisGB = Tabs.Visual:AddGroupbox({Side="Left",  Name="Camera & Effects", IconName="image"})
+local JDGB  = Tabs.Visual:AddGroupbox({Side="Right", Name="John Doe",         IconName="skull"})
+
+AddFeature(VisGB, "ExtendedFOV", {
+    DisplayTitle = "Extended FOV", DisplayDescription = "FOV beyond the game's max",
+    InstanceType = "NumberValue", DefaultInstanceValue = 70, Savable = true,
+    ExtraData = {MinValue = 10, MaxValue = 120, Step = 5},
+    ScriptFunction = function(self, v)
+        local fov = PlayerData and (PlayerData:FindFirstChild("FieldOfView", true) or PlayerData:FindFirstChild("FOV", true))
+        if fov then fov.Value = v end
     end,
 })
-AddFeature(GB.QTE, "AutoEscape", {
-    DisplayTitle = "Auto Escape", DisplayDescription = "Auto-escapes Nosferatu's hook QTE",
-    InstanceType = "BoolValue", DefaultInstanceValue = false, Savable = true,
-    CustomSetup = function()
-        if not TempUI then return end
-        Track(TempUI.ChildAdded:Connect(function(ui)
-            if ui.Name:upper() == "QTE" then
-                while ui and ui.Visible do
-                    local cd = GetValue("EscapeCooldown") or 0.5
-                    task.wait(Random.new():NextNumber(cd * 0.8, cd * 1.2))
-                    if GetValue("AutoEscape") and KillersFolder and Network then
-                        for _, v in KillersFolder:GetChildren() do
-                            if v.Name:lower() == "nosferatu" then
-                                local plr = Players:GetPlayerFromCharacter(v)
-                                if plr then
-                                    pcall(function() Network:FindFirstChildOfClass("RemoteEvent"):FireServer(plr.Name .. "NosHookQTE", {true}) end)
-                                end
-                            end
-                        end
-                    end
-                end
-            end
-        end))
+AddFeature(VisGB, "ExtendedZoom", {
+    DisplayTitle = "Extended Zoom", DisplayDescription = "Extends max camera zoom distance",
+    InstanceType = "NumberValue", DefaultInstanceValue = 10, Savable = true,
+    ExtraData = {MinValue = 0, MaxValue = 100, Step = 5},
+    ScriptFunction = function(self, v)
+        LocalPlayer.CameraMaxZoomDistance = game:GetService("StarterPlayer").CameraMaxZoomDistance + v * 0.25
     end,
 })
-AddFeature(GB.QTE, "EscapeCooldown", {
-    DisplayTitle = "Auto Escape Cooldown", DisplayDescription = "Seconds between auto-escape attempts",
-    InstanceType = "NumberValue", DefaultInstanceValue = 0.5, Savable = true,
-    ExtraData = {MinValue = 0.2, MaxValue = 1.2, Step = 0.1},
-})
-AddFeature(GB.QTE, "AutoDisarm", {
-    DisplayTitle = "Auto Disarm (Azure)", DisplayDescription = "Auto-disarms Azure's traps",
+AddFeature(VisGB, "ShowChat", {
+    DisplayTitle = "Show Chat", DisplayDescription = "Keeps chat visible during rounds",
     InstanceType = "BoolValue", DefaultInstanceValue = false, Savable = true,
     ScriptFunction = function(self, v)
-        if CurrentQTEAzure and v then CurrentQTEAzure:AddProgress(100); CurrentQTEAzure = nil end
+        local cw = TextChatService:FindFirstChildOfClass("ChatWindowConfiguration")
+        if cw and not SideBar:GetAttribute("WasVisible") then cw.Enabled = v end
+    end,
+})
+AddFeature(VisGB, "HideInjury", {
+    DisplayTitle = "Hide Injured UI", DisplayDescription = "Hides low-HP screen effects",
+    InstanceType = "BoolValue", DefaultInstanceValue = true, Savable = true,
+    ScriptFunction = function(self, v)
+        if TempUI then for _, e in TempUI:QueryDescendants("#redFlash,#injuredVignette") do e.Visible = not v end end
+        if Lighting:FindFirstChild("HealthDesaturation") then Lighting.HealthDesaturation.Enabled = not v end
+    end,
+})
+AddFeature(VisGB, "DisableBlindness", {
+    DisplayTitle = "Disable Blindness", DisplayDescription = "Disables the blindness effect",
+    InstanceType = "BoolValue", DefaultInstanceValue = true, Savable = true,
+    ScriptFunction = function(self, v)
+        for _, e in Lighting:QueryDescendants("#BlindnessBlur BlurEffect") do e.Enabled = not v end
     end,
 })
 
--- ============================================================
--- ═══ FEATURES TAB ═══
--- ============================================================
-AddFeature(GB.Protect, "Invincible", {
-    DisplayTitle = "Invincible", DisplayDescription = "Invisible + invulnerable (abilities still work)",
-    InstanceType = "BoolValue", DefaultInstanceValue = false, Savable = false,
-    ScriptFunction = function(self, v)
-        if workspace:GetAttribute("Invincible") == nil then
-            workspace:SetAttribute("Invincible", v)
-            if v then
-                local dt = GetValue("DisableToxicTrails", true); if dt then dt.Value = true end
-                local df = GetValue("DisableFootprints", true); if df then df.Value = true end
-            end
-            task.delay(1.5, function() workspace:SetAttribute("Invincible", nil) end)
-        end
-    end,
-})
-AddFeature(GB.Protect, "DisableKillerWalls", {
-    DisplayTitle = "Disable Killer Walls", DisplayDescription = "Walk through thin killer-only walls",
-    InstanceType = "BoolValue", DefaultInstanceValue = false, Savable = false,
-    ScriptFunction = function(self, v)
-        local folder = GameMap and (GameMap:FindFirstChild("KillerDoors", true) or GameMap:FindFirstChild("Killer Doors", true))
-        if not folder then return end
-        for _, p in folder:GetChildren() do
-            if p:IsA("BasePart") and math.min(p.Size.X, p.Size.Z) <= 5 then
-                p.CanTouch = true
-                if p:GetAttribute("OriginalCanCollide") == nil then
-                    p:SetAttribute("OriginalCanCollide", p.CanCollide)
-                end
-                p.CanCollide = p:GetAttribute("OriginalCanCollide") ~= false and not v or false
-            end
-        end
-    end,
-})
-AddFeature(GB.Protect, "EnableJumping", {
-    DisplayTitle = "Enable Jumping", DisplayDescription = "Restores jumping when the game disables it",
-    InstanceType = "BoolValue", DefaultInstanceValue = false, Savable = false,
-    ScriptFunction = function(self, v) if LocalHumanoid then LocalHumanoid.JumpPower = v and 47 or 0 end end,
-    CharacterAdded = function(self)
-        task.delay(0.25, function() if LocalHumanoid then LocalHumanoid.JumpPower = GetValue("EnableJumping") and 47 or 0 end end)
-    end,
-})
-
-AddFeature(GB.JohnDoe, "DisableToxicTrails", {
-    DisplayTitle = "Disable John Doe Trails", DisplayDescription = "Disables John Doe's damaging trail",
+AddFeature(JDGB, "DisableToxicTrails", {
+    DisplayTitle = "Disable John Doe Trails", DisplayDescription = "Disables John Doe's trail damage",
     InstanceType = "BoolValue", DefaultInstanceValue = false, Savable = true,
     ScriptFunction = function(self, v)
         if not InGame then return end
@@ -449,8 +1202,8 @@ AddFeature(GB.JohnDoe, "DisableToxicTrails", {
         end
     end,
 })
-AddFeature(GB.JohnDoe, "DisableFootprints", {
-    DisplayTitle = "Disable John Doe Footprints", DisplayDescription = "Disables John Doe's footprint damage",
+AddFeature(JDGB, "DisableFootprints", {
+    DisplayTitle = "Disable John Doe Footprints", DisplayDescription = "Disables footprint damage",
     InstanceType = "BoolValue", DefaultInstanceValue = false, Savable = true,
     ScriptFunction = function(self, v)
         if not InGame then return end
@@ -461,8 +1214,8 @@ AddFeature(GB.JohnDoe, "DisableFootprints", {
         end
     end,
 })
-AddFeature(GB.JohnDoe, "SmallerSpikeCollisions", {
-    DisplayTitle = "Smaller Spike Collisions", DisplayDescription = "Smaller spike hitboxes for John Doe's ability",
+AddFeature(JDGB, "SmallerSpikeCollisions", {
+    DisplayTitle = "Smaller Spike Collisions", DisplayDescription = "Smaller spike hitboxes",
     InstanceType = "BoolValue", DefaultInstanceValue = false, Savable = true,
     ScriptFunction = function(self, v)
         if not InGame then return end
@@ -475,356 +1228,41 @@ AddFeature(GB.JohnDoe, "SmallerSpikeCollisions", {
     end,
 })
 
-AddFeature(GB.Movement, "StaminaPreset", {
-    DisplayTitle = "Stamina Preset", DisplayDescription = "Original / Realistic / Semi-Realistic / Infinite",
-    InstanceType = "StringValue", DefaultInstanceValue = "Original", Savable = true,
-    ExtraData = {Options = "Original|Realistic|Semi-Realistic|Infinite"},
-    OnLoop = function(self)
-        if not MainModule or not MainModule.MaxStamina then return end
-        local preset = GetValue("StaminaPreset")
-        if preset == "Original" then return end
-        local maxSt = MainModule.MaxStamina
-        local cur = MainModule.Stamina or maxSt
-        if preset == "Infinite" then
-            rawset(MainModule, "Stamina", maxSt)
-        elseif preset == "Semi-Realistic" then
-            rawset(MainModule, "Stamina", math.min(cur + maxSt * 0.006, maxSt))
-        elseif preset == "Realistic" then
-            rawset(MainModule, "Stamina", math.min(cur + maxSt * 0.003, maxSt))
-        end
-    end,
+-- ═══════════════════════════════════════════════════════════
+-- MISC
+-- ═══════════════════════════════════════════════════════════
+local MiscGB   = Tabs.Misc:AddGroupbox({Side="Left",  Name="General", IconName="box"})
+local ServerGB = Tabs.Misc:AddGroupbox({Side="Right", Name="Server",  IconName="server"})
+
+AddFeature(MiscGB, "Invincible", {
+    DisplayTitle = "Invincible", DisplayDescription = "Invisible + invulnerable",
+    InstanceType = "BoolValue", DefaultInstanceValue = false, Savable = false,
     ScriptFunction = function(self, v)
-        if v == "Original" and MainModule and MainModule.MaxStamina then
-            rawset(MainModule, "Stamina", MainModule.MaxStamina)
+        if workspace:GetAttribute("Invincible") == nil then
+            workspace:SetAttribute("Invincible", v)
+            if v then
+                local dt = GetValue("DisableToxicTrails", true); if dt then dt.Value = true end
+                local df = GetValue("DisableFootprints", true); if df then df.Value = true end
+            end
+            task.delay(1.5, function() workspace:SetAttribute("Invincible", nil) end)
         end
     end,
 })
-AddFeature(GB.Movement, "AntiSlowness", {
-    DisplayTitle = "Anti Slowness", DisplayDescription = "Removes all slowness effects",
-    InstanceType = "BoolValue", DefaultInstanceValue = false, Savable = true,
-    ScriptFunction = function(self, v)
-        if not v or not SpeedMultipliers then return end
-        for _, c in SpeedMultipliers:GetChildren() do
-            if c:IsA("NumberValue") and c.Name ~= "Sprinting" and c.Name:lower() ~= "emoting"
-                and c.Name ~= "DirectionalMovement" and c.Name ~= "FixingGenerator"
-                and c.Name:upper() ~= "ENRAGED" and c.Value > 0.05 and c.Value < 1 then
-                c.Value = 1
-            end
-        end
+AddFeature(MiscGB, "EnableJumping", {
+    DisplayTitle = "Enable Jumping", DisplayDescription = "Restores jumping when the game disables it",
+    InstanceType = "BoolValue", DefaultInstanceValue = false, Savable = false,
+    ScriptFunction = function(self, v) if LocalHumanoid then LocalHumanoid.JumpPower = v and 47 or 0 end end,
+    CharacterAdded = function()
+        task.delay(0.25, function() if LocalHumanoid then LocalHumanoid.JumpPower = GetValue("EnableJumping") and 47 or 0 end end)
     end,
 })
-AddFeature(GB.Movement, "NoliControl", {
-    DisplayTitle = "Better Void Rush", DisplayDescription = "Better control of Noli's Void Rush ability",
-    InstanceType = "BoolValue", DefaultInstanceValue = false, Savable = true,
-    ScriptFunction = function(self, v)
-        if not NoliConfig then return end
-        for _, entry in {
-            {Name = "InitialTurnDuration", Value = 0.005, Default = 1.5},
-            {Name = "TurnSpeed", Value = 10000, Default = 1},
-            {Name = "InitialTurnMult", Value = 1000, Default = 6.6},
-        } do
-            local _, key, parent = TableValueFind(NoliConfig, function(k) return type(k) == "string" and k:find(entry.Name) and not k:find("OG") end)
-            if key and parent then
-                if v then parent[key .. "OG"] = parent[key .. "OG"] or parent[key]; parent[key] = entry.Value
-                else parent[key] = parent[key .. "OG"] or entry.Default end
-            end
-        end
-    end,
-})
-AddFeature(GB.Movement, "ControllableDash", {
-    DisplayTitle = "Controllable Coolkidd Dash", DisplayDescription = "Coolkidd's dash becomes steerable",
-    InstanceType = "BoolValue", DefaultInstanceValue = false, Savable = true,
-})
-
--- ─── Auto Block (predictive + sweep) ───
-AddFeature(GB.Combat, "AutoBlock", {
-    DisplayTitle = "Auto Block", DisplayDescription = "Predictive block: fires on attack anim start + PreSimulation sweep",
-    InstanceType = "BoolValue", DefaultInstanceValue = false, Savable = true,
-    CustomSetup = function()
-        if not KillersFolder then return end
-        local LEAD, COOLDOWN, SWEEP_WINDOW, SWEEP_MUL = 0.02, 0.35, 0.55, 2.5
-
-        local function SetupKiller(Killer)
-            local Hum = Killer:FindFirstChildOfClass("Humanoid") or Killer:WaitForChild("Humanoid", 5)
-            local Anim = Hum and Hum:FindFirstChildOfClass("Animator")
-            if not Anim then return end
-
-            local lastBlockAt = 0
-            local remote = Network and Network:FindFirstChildOfClass("RemoteEvent")
-
-            local function DoBlock()
-                if tick() - lastBlockAt < COOLDOWN then return end
-                lastBlockAt = tick()
-                local btn = MainUI and MainUI:FindFirstChild("AbilityContainer") and MainUI.AbilityContainer:FindFirstChild("Block")
-                if btn and btn.MouseButton1Click and firesignalFn then pcall(firesignalFn, btn.MouseButton1Click) end
-                if remote then
-                    pcall(function() remote:FireServer("UseActorAbility", {"Block"}) end)
-                    pcall(function() remote:FireServer("UseActorAbility", "Block") end)
-                end
-            end
-
-            local selfParams = OverlapParams.new()
-            selfParams.FilterType = Enum.RaycastFilterType.Include
-            selfParams.MaxParts = 1
-
-            Track(Anim.AnimationPlayed:Connect(function(track)
-                if not GetValue("AutoBlock") then return end
-                if not LocalCharacter or LocalCharacter.Parent ~= SurvivorsFolder then return end
-                if not LocalCharacter:FindFirstChild("QueryHitbox") then return end
-                local kr = Killer:FindFirstChild("HumanoidRootPart")
-                if not (kr and LocalRoot and (kr.Position - LocalRoot.Position).Magnitude < 25) then return end
-
-                task.delay(LEAD, DoBlock)
-
-                local stop = tick() + math.min(track.Length > 0 and track.Length or SWEEP_WINDOW, SWEEP_WINDOW)
-                local conn
-                conn = Track(RunService.PreSimulation:Connect(function()
-                    if tick() > stop or not GetValue("AutoBlock") or not conn then
-                        if conn then conn:Disconnect() end; return
-                    end
-                    if not LocalCharacter or not LocalCharacter:FindFirstChild("QueryHitbox") then
-                        if conn then conn:Disconnect() end; return
-                    end
-                    local kh = Killer:FindFirstChild("QueryHitbox")
-                    if not kh then return end
-                    selfParams.FilterDescendantsInstances = {LocalCharacter.QueryHitbox}
-                    local p = Instance.new("Part")
-                    p.Size = Vector3.new(5.2, 6, 5.65) * SWEEP_MUL
-                    p.CFrame = kh.CFrame * CFrame.new(0, 0, -3.5)
-                    p.CanCollide = false; p.Anchored = true; p.CastShadow = false; p.Transparency = 1
-                    p.Parent = Hitboxes or workspace
-                    local hit = #workspace:GetPartsInPart(p, selfParams) > 0
-                    p:Destroy()
-                    if hit then DoBlock() end
-                end))
-            end))
-
-            -- guest punching
-            if LocalCharacter then
-                Track(LocalCharacter:GetAttributeChangedSignal("TimesHit"):Connect(function()
-                    if not GetValue("AutoPunch") then return end
-                    if not SpeedMultipliers:FindFirstChild("GuestBlocking") then return end
-                    if (LocalHumanoid:GetAttribute("Overheal") or 0) < 10 then return end
-                    task.wait(0.08)
-                    local btn = MainUI and MainUI:FindFirstChild("AbilityContainer") and MainUI.AbilityContainer:FindFirstChild("Punch")
-                    if btn and btn.MouseButton1Click and firesignalFn then pcall(firesignalFn, btn.MouseButton1Click) end
-                    if remote then
-                        pcall(function() remote:FireServer("UseActorAbility", {"Punch"}) end)
-                        pcall(function() remote:FireServer("UseActorAbility", "Punch") end)
-                    end
-                end))
-            end
-        end
-
-        Track(KillersFolder.ChildAdded:Connect(function(k) task.wait(0.5); SetupKiller(k) end))
-        for _, k in KillersFolder:GetChildren() do task.spawn(SetupKiller, k) end
-    end,
-})
-AddFeature(GB.Combat, "AutoPunch", {
-    DisplayTitle = "Auto Punch", DisplayDescription = "Auto-punch after a successful block",
-    InstanceType = "BoolValue", DefaultInstanceValue = false, Savable = true,
-})
-AddFeature(GB.GenCfg, "EnableOverride", {
-    DisplayTitle = "Override Generator Grid", DisplayDescription = "Force a custom puzzle grid size",
-    InstanceType = "BoolValue", DefaultInstanceValue = false, Savable = true,
-})
-AddFeature(GB.GenCfg, "GridSize", {
-    DisplayTitle = "Generator Grid Size", DisplayDescription = "4x4 up to 12x12",
-    InstanceType = "NumberValue", DefaultInstanceValue = 6, Savable = true,
-    ExtraData = {MinValue = 4, MaxValue = 12, Step = 1},
-})
-AddFeature(GB.Cosmetic, "AnimationChanger", {
-    DisplayTitle = "Animation Changer", DisplayDescription = "Override local animations with another character's",
-    InstanceType = "StringValue", DefaultInstanceValue = "Original", Savable = false,
-    ExtraData = {Options = "Original|Jason|Slasher|c00lkidd|John Doe|Noli|1x1x1x1|Nosferatu|Azure|Dusekkar|Artful|Erlking|Herobrine|Sukuna|Retro|Mafioso|The Admin|Deceiver|The Pestilence|P4rtyPwny|Killer Kyle|Pursuer|TV TIME|White Pumpkin|Crouch|Default Roblox"},
-})
-
--- ============================================================
--- ═══ VISUALS TAB ═══
--- ============================================================
-AddFeature(GB.NPC, "DisableNoliNPC", {
-    DisplayTitle = "Disable Noli NPC", DisplayDescription = "Hides Noli's distracting NPC clone",
-    InstanceType = "BoolValue", DefaultInstanceValue = false, Savable = true,
-    ScriptFunction = function(self, v)
-        if not KillersFolder then return end
-        if v then
-            for _, m in KillersFolder:GetChildren() do
-                if m.Name:lower() == "noli" and not Players:GetPlayerFromCharacter(m) then
-                    m.Parent = Lighting; m:PivotTo(m:GetPivot() * CFrame.new(0, -100, 0))
-                end
-            end
-        else
-            for _, m in Lighting:GetChildren() do
-                if m.Name:lower() == "noli" then m.Parent = InGame; m:PivotTo(m:GetPivot() * CFrame.new(0, 100, 0)) end
-            end
-        end
-    end,
-})
-AddFeature(GB.NPC, "Disable007n7NPC", {
-    DisplayTitle = "Disable 007n7 NPC", DisplayDescription = "Hides 007n7's distracting NPC clone",
-    InstanceType = "BoolValue", DefaultInstanceValue = false, Savable = true,
-    ScriptFunction = function(self, v)
-        if not InGame then return end
-        if v then
-            for _, m in InGame:GetChildren() do
-                if m.Name:lower() == "007n7" and not Players:GetPlayerFromCharacter(m) then m.Parent = Lighting end
-            end
-        else
-            for _, m in Lighting:GetChildren() do
-                if m.Name:lower() == "007n7" then m.Parent = InGame end
-            end
-        end
-    end,
-})
-
--- ─── ESP (rewritten) ───
-AddFeature(GB.ESP, "ESP", {
-    DisplayTitle = "ESP Master", DisplayDescription = "Wallhack for players, generators, and items",
-    InstanceType = "BoolValue", DefaultInstanceValue = false, Savable = true,
-    ScriptFunction = function(self, v)
-        if not v then
-            for _, root in {PlayersFolder, GameMap, InGame, workspace} do
-                if root then
-                    for _, d in root:GetDescendants() do
-                        local h = d:FindFirstChild("_SS_ESP");   if h then h:Destroy() end
-                        local t = d:FindFirstChild("_SS_ESPText"); if t then t:Destroy() end
-                    end
-                end
-            end
-        end
-    end,
-    OnLoop = function()
-        if not GetValue("ESP") then return end
-        local cam = workspace.CurrentCamera
-        if not cam then return end
-        -- players
-        if PlayersFolder then
-            for _, pm in PlayersFolder:QueryDescendants("#Killers > Instance, #Survivors > Instance") do
-                local plr = Players:GetPlayerFromCharacter(pm)
-                local hum = pm:FindFirstChildOfClass("Humanoid")
-                local root = pm:FindFirstChild("HumanoidRootPart")
-                local folder = pm.Parent and pm.Parent.Name or ""
-                local en = GetValue(folder .. "ESP")
-                if plr and hum and hum.Health > 0 and root and en then
-                    local color = ColorPresets[GetValue(folder .. "Color")] or Color3.new(1,1,1)
-                    local hl = pm:FindFirstChild("_SS_ESP")
-                    if not hl then
-                        hl = Instance.new("Highlight"); hl.Name = "_SS_ESP"
-                        hl.FillTransparency = 0.55; hl.OutlineTransparency = 0
-                        hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-                        hl.Adornee = pm; hl.Parent = pm
-                    end
-                    hl.FillColor = color; hl.OutlineColor = color
-                    if GetValue("ShowText") then
-                        local bg = pm:FindFirstChild("_SS_ESPText")
-                        if not bg then
-                            bg = Instance.new("BillboardGui")
-                            bg.Name = "_SS_ESPText"; bg.Adornee = root
-                            bg.Size = UDim2.fromOffset(180, 44)
-                            bg.StudsOffset = Vector3.new(0, 3.2, 0)
-                            bg.AlwaysOnTop = true; bg.Parent = pm
-                            local t = Instance.new("TextLabel")
-                            t.Parent = bg; t.Size = UDim2.fromScale(1, 1)
-                            t.BackgroundTransparency = 1; t.TextScaled = true
-                            t.TextStrokeTransparency = 0.4
-                            t.Font = Enum.Font.GothamBold
-                        end
-                        bg.Adornee = root
-                        local t = bg:FindFirstChildWhichIsA("TextLabel")
-                        if t then t.Text = plr.Name; t.TextColor3 = color end
-                    else
-                        local bg = pm:FindFirstChild("_SS_ESPText"); if bg then bg:Destroy() end
-                    end
-                else
-                    local hl = pm:FindFirstChild("_SS_ESP"); if hl then hl:Destroy() end
-                    local bg = pm:FindFirstChild("_SS_ESPText"); if bg then bg:Destroy() end
-                end
-            end
-        end
-        -- generators
-        if GameMap and GetValue("GeneratorsESP") then
-            local color = ColorPresets[GetValue("GeneratorsColor")] or Color3.new(0,1,1)
-            for _, gen in GameMap:QueryDescendants("Model#Generator:has(#Main)") do
-                local prog = gen:FindFirstChild("Progress")
-                local done = GetValue("GeneratorsCheck") and prog and prog.Value >= 100
-                if done then
-                    local h = gen:FindFirstChild("_SS_ESP"); if h then h:Destroy() end
-                else
-                    local hl = gen:FindFirstChild("_SS_ESP")
-                    if not hl then
-                        hl = Instance.new("Highlight"); hl.Name = "_SS_ESP"
-                        hl.FillTransparency = 0.55
-                        hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-                        hl.Adornee = gen; hl.Parent = gen
-                    end
-                    hl.FillColor = color; hl.OutlineColor = color
-                end
-            end
-        end
-    end,
-})
-AddFeature(GB.ESP, "ShowText", {DisplayTitle="ESP Show Names", DisplayDescription="Show player names above highlights", InstanceType="BoolValue", DefaultInstanceValue=true, Savable=true})
-AddFeature(GB.ESP, "KillersESP", {DisplayTitle="Killer ESP", InstanceType="BoolValue", DefaultInstanceValue=true, Savable=true})
-AddFeature(GB.ESP, "SurvivorsESP", {DisplayTitle="Survivor ESP", InstanceType="BoolValue", DefaultInstanceValue=false, Savable=true})
-AddFeature(GB.ESP, "GeneratorsESP", {DisplayTitle="Generator ESP", InstanceType="BoolValue", DefaultInstanceValue=false, Savable=true})
-AddFeature(GB.ESP, "GeneratorsCheck", {DisplayTitle="Hide Finished Gens", InstanceType="BoolValue", DefaultInstanceValue=true, Savable=true})
-AddFeature(GB.ESP, "ItemsESP", {DisplayTitle="Item ESP", InstanceType="BoolValue", DefaultInstanceValue=false, Savable=true})
-AddFeature(GB.ESPColor, "KillersColor",    {DisplayTitle="Killer ESP Color",    InstanceType="StringValue", DefaultInstanceValue="Red",   Savable=true, ExtraData={Options="Red|Orange|Purple|Gold"}})
-AddFeature(GB.ESPColor, "SurvivorsColor",  {DisplayTitle="Survivor ESP Color",  InstanceType="StringValue", DefaultInstanceValue="Green", Savable=true, ExtraData={Options="Green|Orange|Purple|Gold"}})
-AddFeature(GB.ESPColor, "GeneratorsColor", {DisplayTitle="Generator ESP Color", InstanceType="StringValue", DefaultInstanceValue="Cyan",  Savable=true, ExtraData={Options="Cyan|Blue|Green|Orange|Purple|Gold"}})
-AddFeature(GB.ESPColor, "ItemsColor",      {DisplayTitle="Item ESP Color",      InstanceType="StringValue", DefaultInstanceValue="Gold",  Savable=true, ExtraData={Options="Gold|Cyan|Purple|White"}})
-
--- ============================================================
--- ═══ MISCELLANEOUS TAB ═══
--- ============================================================
-AddFeature(GB.View, "ExtendedFOV", {
-    DisplayTitle = "Extended FOV", DisplayDescription = "Extended FOV beyond the game's max",
-    InstanceType = "NumberValue", DefaultInstanceValue = 70, Savable = true,
-    ExtraData = {MinValue = 10, MaxValue = 120, Step = 5},
-    ScriptFunction = function(self, v)
-        local fov = PlayerData and (PlayerData:FindFirstChild("FieldOfView", true) or PlayerData:FindFirstChild("FOV", true))
-        if fov then fov.Value = v end
-    end,
-})
-AddFeature(GB.View, "ExtendedZoom", {
-    DisplayTitle = "Extended Zoom", DisplayDescription = "Extends max camera zoom distance",
-    InstanceType = "NumberValue", DefaultInstanceValue = 10, Savable = true,
-    ExtraData = {MinValue = 0, MaxValue = 100, Step = 5},
-    ScriptFunction = function(self, v)
-        LocalPlayer.CameraMaxZoomDistance = game:GetService("StarterPlayer").CameraMaxZoomDistance + v * 0.25
-    end,
-})
-AddFeature(GB.View, "ShowChat", {
-    DisplayTitle = "Show Chat", DisplayDescription = "Keeps chat visible during rounds",
-    InstanceType = "BoolValue", DefaultInstanceValue = false, Savable = true,
-    ScriptFunction = function(self, v)
-        local cw = TextChatService:FindFirstChildOfClass("ChatWindowConfiguration")
-        if cw and not SideBar:GetAttribute("WasVisible") then cw.Enabled = v end
-    end,
-})
-AddFeature(GB.View, "HideInjury", {
-    DisplayTitle = "Hide Injured UI", DisplayDescription = "Hides low-HP screen effects",
-    InstanceType = "BoolValue", DefaultInstanceValue = true, Savable = true,
-    ScriptFunction = function(self, v)
-        if TempUI then for _, e in TempUI:QueryDescendants("#redFlash,#injuredVignette") do e.Visible = not v end end
-        if Lighting:FindFirstChild("HealthDesaturation") then Lighting.HealthDesaturation.Enabled = not v end
-    end,
-})
-AddFeature(GB.View, "DisableBlindness", {
-    DisplayTitle = "Disable Blindness", DisplayDescription = "Disables the blindness effect",
-    InstanceType = "BoolValue", DefaultInstanceValue = true, Savable = true,
-    ScriptFunction = function(self, v)
-        for _, e in Lighting:QueryDescendants("#BlindnessBlur BlurEffect") do e.Enabled = not v end
-    end,
-})
-AddFeature(GB.Server, "DeleteRagdolls", {
+AddFeature(MiscGB, "DeleteRagdolls", {
     DisplayTitle = "Delete Ragdolls", DisplayDescription = "Deletes all ragdolls for performance",
     InstanceType = "BoolValue", DefaultInstanceValue = false, Savable = true,
-    ScriptFunction = function(self, v)
-        if v and RagdollsFolder then RagdollsFolder:ClearAllChildren() end
-    end,
+    ScriptFunction = function(self, v) if v and RagdollsFolder then RagdollsFolder:ClearAllChildren() end end,
 })
-GB.Server:AddButton({
+
+ServerGB:AddButton({
     Text = "Rejoin Server",
     Func = function()
         if not workspace:GetAttribute("LoadingTeleport") then
@@ -832,52 +1270,27 @@ GB.Server:AddButton({
             game:GetService("TeleportService"):TeleportToPlaceInstance(game.PlaceId, game.JobId)
         end
     end,
-    DoubleClick = false,
     Tooltip = "Rejoins the exact same server",
 })
 
--- ============================================================
--- ═══ UI SETTINGS TAB ═══
--- ============================================================
+-- ═══════════════════════════════════════════════════════════
+-- UI SETTINGS
+-- ═══════════════════════════════════════════════════════════
 local MenuGroup = Tabs.UI:AddGroupbox({Side="Left", Name="Menu", IconName="wrench"})
-MenuGroup:AddToggle("KeybindMenuOpen", {
-    Default = Library.KeybindFrame.Visible,
-    Text = "Open Keybind Menu",
-    Callback = function(v) Library.KeybindFrame.Visible = v end,
-})
-MenuGroup:AddToggle("ShowCustomCursor", {
-    Default = Library.ShowCustomCursor,
-    Text = "Custom Cursor",
-    Callback = function(v) Library.ShowCustomCursor = v end,
-})
-MenuGroup:AddToggle("AlwaysOnTop", {
-    Default = Window.AlwaysOnTop,
-    Text = "Always On Top",
-    Callback = function(v) Window:SetAlwaysOnTop(v) end,
-})
-MenuGroup:AddDropdown("NotificationSide", {
-    Values = {"Left", "Right"}, Default = "Right",
-    Text = "Notification Side",
-    Callback = function(v) Library:SetNotifySide(v) end,
-})
-MenuGroup:AddDropdown("DPIDropdown", {
-    Values = {"50%","75%","100%","125%","150%","175%","200%"}, Default = "100%",
-    Text = "DPI Scale",
-    Callback = function(v) Library:SetDPIScale(tonumber(v:gsub("%%",""))) end,
-})
-MenuGroup:AddSlider("UICornerSlider", {
-    Text = "Corner Radius", Default = Library.CornerRadius,
-    Min = 0, Max = 20, Rounding = 0,
-    Callback = function(v) Window:SetCornerRadius(v) end,
-})
+MenuGroup:AddToggle("KeybindMenuOpen", { Default = Library.KeybindFrame.Visible, Text = "Open Keybind Menu", Callback = function(v) Library.KeybindFrame.Visible = v end })
+MenuGroup:AddToggle("ShowCustomCursor", { Default = Library.ShowCustomCursor, Text = "Custom Cursor", Callback = function(v) Library.ShowCustomCursor = v end })
+MenuGroup:AddToggle("AlwaysOnTop", { Default = Window.AlwaysOnTop, Text = "Always On Top", Callback = function(v) Window:SetAlwaysOnTop(v) end })
+MenuGroup:AddDropdown("NotificationSide", { Values={"Left","Right"}, Default="Right", Text="Notification Side", Callback=function(v) Library:SetNotifySide(v) end })
+MenuGroup:AddDropdown("DPIDropdown", { Values={"50%","75%","100%","125%","150%","175%","200%"}, Default="100%", Text="DPI Scale", Callback=function(v) Library:SetDPIScale(tonumber(v:gsub("%%",""))) end })
+MenuGroup:AddSlider("UICornerSlider", { Text="Corner Radius", Default=Library.CornerRadius, Min=0, Max=20, Rounding=0, Callback=function(v) Window:SetCornerRadius(v) end })
 MenuGroup:AddDivider()
-MenuGroup:AddLabel("Menu bind"):AddKeyPicker("MenuKeybind", {Default = "RightShift", NoUI = true, Text = "Menu keybind"})
+MenuGroup:AddLabel("Menu bind"):AddKeyPicker("MenuKeybind", {Default="RightShift", NoUI=true, Text="Menu keybind"})
 MenuGroup:AddButton("Unload", function() Library:Unload() end)
 
 Library.ToggleKeybind = Options.MenuKeybind
 
 -- ============================================================
--- Addons (Theme + Save managers)
+-- Addons
 -- ============================================================
 ThemeManager:SetLibrary(Library)
 SaveManager:SetLibrary(Library)
@@ -890,7 +1303,7 @@ ThemeManager:ApplyToTab(Tabs.UI)
 SaveManager:LoadAutoloadConfig()
 
 -- ============================================================
--- Character watcher (refreshes state on respawn)
+-- Character watcher
 -- ============================================================
 local function OnCharacter(char)
     LocalCharacter = char
@@ -906,23 +1319,24 @@ LocalPlayer.CharacterAdded:Connect(OnCharacter)
 OnCharacter(LocalCharacter or LocalPlayer.Character)
 
 -- ============================================================
--- Cleanup on unload
+-- Cleanup
 -- ============================================================
 Library:OnUnload(function()
     for _, c in Connections do pcall(function() c:Disconnect() end) end
     table.clear(Connections)
+    for k in pairs(facingVisuals) do removeFacingVisual(k) end
     if PlusFolderSettings then pcall(function() PlusFolderSettings:Destroy() end) end
     local flag = CoreGui:FindFirstChild("Slashsaken")
     if flag then flag:Destroy() end
 end)
 
 -- ============================================================
--- Boot notification
+-- Boot
 -- ============================================================
 Library:Notify({
     Title = BrandName .. " · by " .. AuthorName,
-    Description = "v" .. Version .. " loaded. " .. #PlusFolderSettings:GetChildren() .. " features wired across " .. #Window.Tabs .. " tabs.",
+    Description = "v" .. Version .. " loaded. " .. #PlusFolderSettings:GetChildren() .. " features across " .. #Window.Tabs .. " tabs.",
     Time = 6,
 })
 
-print(BrandName .. " v" .. Version .. " by " .. AuthorName .. " — Obsidian UI, loaded successfully.")
+print(BrandName .. " v" .. Version .. " by " .. AuthorName .. " loaded. Name-based Auto Block + HDT + Aim Punch.")
